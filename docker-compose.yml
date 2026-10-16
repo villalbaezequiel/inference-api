@@ -1,0 +1,26 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    ports:
+      - "6379:6379"
+
+  app:
+    build: .
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      API_KEYS: ${API_KEYS:-dev-key-123:client-demo,dev-key-456:client-b}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-60}
+      CACHE_TTL_S: ${CACHE_TTL_S:-3600}
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
