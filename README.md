@@ -98,6 +98,28 @@ Con Redis caído o el circuito abierto responde `"status": "degraded"` (200); si
 Una línea JSON por request en stdout (`make logs`), con `timestamp`, `request_id`, `client_id`,
 `model`, `latency_ms`, `cache_hit` y `status`. Nivel configurable con `LOG_LEVEL`.
 
+### `GET /metrics` — métricas Prometheus (bonus)
+
+```bash
+curl -s localhost:8000/metrics | grep -E '^(http_requests_total|cache_requests_total)'
+# http_requests_total{endpoint="/v1/infer",method="POST",status="200"} 2.0
+# cache_requests_total{result="hit"} 1.0
+# cache_requests_total{result="miss"} 1.0
+```
+
+Requests totales, latencia (`http_request_duration_seconds`) y cache hits/misses.
+
+### Carga con locust (bonus)
+
+```bash
+make load           # locust headless 60 s a ~105 RPS contra docker compose
+```
+
+Levanta la app con rate limit alto (para medir capacidad, no el limitador) y deja CSV y
+`report.html` en `loadtest/results/`. Interactivo: `docker compose --profile load up locust` →
+http://localhost:8089. Resultado de referencia: 102.6 RPS, 0 errores
+([RESULTS.md](loadtest/results/RESULTS.md)).
+
 ## Desarrollo
 
 ```bash
@@ -119,12 +141,13 @@ uvicorn --factory app.main:create_app --reload
 ```
 app/
   main.py               app
-  api/routes/           infer.py, stream.py, classify.py, health.py
+  api/routes/           infer.py, stream.py, classify.py, health.py, metrics.py
   api/middleware/       auth.py, rate_limit.py
   core/llm_client.py    llm_client
   core/ml_model.py      ml_model
   core/train.py         entrenamiento de los artefactos v1/v2
   core/cache.py         cache
 tests/                  tests
+loadtest/               locustfile + resultados
 DECISIONS.md            ← el documento importante
 ```
