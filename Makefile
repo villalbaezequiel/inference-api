@@ -1,4 +1,4 @@
-.PHONY: up down logs install test lint format
+.PHONY: up down logs install models test lint format
 
 up:            ## Levanta app + Redis
 	docker compose up --build -d
@@ -12,6 +12,9 @@ logs:
 
 install:       ## Dependencias locales (venv recomendado)
 	pip install -r requirements-dev.txt
+
+models:        ## Entrena los artefactos v1/v2 en ./models (para correr fuera de Docker)
+	python -m app.core.train --out models
 
 test:          ## Corre la suite de tests
 	pytest -q

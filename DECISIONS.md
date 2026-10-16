@@ -3,27 +3,29 @@
 Documento de arquitectura y trade-offs. Está escrito para que un TL entienda **qué**
 hice, **por qué** y **qué dejé afuera a propósito**. Se actualiza en cada etapa.
 
-> Estado: **etapa 2 — R2**. `/v1/stream` (SSE) con cancelación upstream, timeout por request,
-> circuit breaker y auditoría en background; escenarios A, B y C. Las decisiones de abajo son el
+> Estado: **etapa 3 — R3**. `/v1/classify` con modelo scikit-learn embebido (v1 y v2), cargado una
+> vez al arranque y servido fuera del event loop; escenarios A, B y C. Las decisiones de abajo son el
 > diseño de partida; cada etapa las confirma o corrige.
 
 ---
 
 ## TL
 
-| Tema                | Decisión                                                               | Por qué                                                                                                    |
-| ------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| Framework / runtime | FastAPI + uvicorn (uvloop, httptools), **1 worker por contenedor**     | El estado en proceso (circuit breaker, coalescing) es por proceso; se escala con réplicas, no con workers. |
-| HTTP client         | `httpx.AsyncClient` compartido (pool de conexiones)                    | Async nativo, timeouts por request, sin `requests` sincrónico.                                             |
-| LLM                 | Interfaz de proveedor con **mock por default**                         | `docker compose up` funciona sin credenciales; la capa HTTP no conoce al proveedor.                        |
-| Fallas de Redis     | **Fail-open** (cache = miss, rate limit = permitir)                    | Perder cache degrada costo; perder el servicio rompe el SLA de 99.9 %.                                     |
-| Rate limiting       | **Sliding window log** en Redis (no in-memory), un único script Lua    | Correcto con varias réplicas; sin el "doble burst" de fixed window; atómico, 1 round-trip.                 |
-| Cache               | Exact-match sobre `sha256(modelo + input normalizado + config)`        | Determinístico y barato; cumple "mismo input + mismo modelo → misma respuesta".                            |
-| Thundering herd     | **Single-flight en 2 niveles**: en proceso + lock `SET NX PX`          | 100 requests idénticos → **1** llamada al LLM, incluso entre réplicas.                                     |
-| Circuit breaker     | Ventana deslizante 5 fallos/30 s → OPEN 60 s → HALF-OPEN, **1** prueba | Lo pedido, con prueba única para no golpear a un proveedor que se está recuperando.                        |
-| Streaming           | `SSEResponse` propio: listener de desconexión + `send` con timeout     | Cancela el upstream **al instante** si el cliente se va; memoria por stream O(1 chunk).                    |
-| Auditoría           | Cola acotada + worker en background → Redis Stream                     | `put_nowait` nunca bloquea el response; si se satura, se descarta y se loguea.                             |
-| App factory         | `create_app()` + `uvicorn --factory`                                   | Cada test crea una app aislada; el estado se inicializa en el lifespan, no al importar.                    |
+| Tema                | Decisión                                                                 | Por qué                                                                                                    |
+| ------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| Framework / runtime | FastAPI + uvicorn (uvloop, httptools), **1 worker por contenedor**       | El estado en proceso (circuit breaker, coalescing) es por proceso; se escala con réplicas, no con workers. |
+| HTTP client         | `httpx.AsyncClient` compartido (pool de conexiones)                      | Async nativo, timeouts por request, sin `requests` sincrónico.                                             |
+| LLM                 | Interfaz de proveedor con **mock por default**                           | `docker compose up` funciona sin credenciales; la capa HTTP no conoce al proveedor.                        |
+| Fallas de Redis     | **Fail-open** (cache = miss, rate limit = permitir)                      | Perder cache degrada costo; perder el servicio rompe el SLA de 99.9 %.                                     |
+| Rate limiting       | **Sliding window log** en Redis (no in-memory), un único script Lua      | Correcto con varias réplicas; sin el "doble burst" de fixed window; atómico, 1 round-trip.                 |
+| Cache               | Exact-match sobre `sha256(modelo + input normalizado + config)`          | Determinístico y barato; cumple "mismo input + mismo modelo → misma respuesta".                            |
+| Thundering herd     | **Single-flight en 2 niveles**: en proceso + lock `SET NX PX`            | 100 requests idénticos → **1** llamada al LLM, incluso entre réplicas.                                     |
+| Circuit breaker     | Ventana deslizante 5 fallos/30 s → OPEN 60 s → HALF-OPEN, **1** prueba   | Lo pedido, con prueba única para no golpear a un proveedor que se está recuperando.                        |
+| Streaming           | `SSEResponse` propio: listener de desconexión + `send` con timeout       | Cancela el upstream **al instante** si el cliente se va; memoria por stream O(1 chunk).                    |
+| Auditoría           | Cola acotada + worker en background → Redis Stream                       | `put_nowait` nunca bloquea el response; si se satura, se descarta y se loguea.                             |
+| Modelo ML           | scikit-learn, artefactos generados en el **build**, carga en el lifespan | Una sola carga por proceso vía `to_thread`; si falta un artefacto la app no arranca.                       |
+| Inferencia ML       | `ThreadPoolExecutor` **dedicado**                                        | CPU-bound fuera del event loop; no compite con el threadpool default de anyio.                             |
+| App factory         | `create_app()` + `uvicorn --factory`                                     | Cada test crea una app aislada; el estado se inicializa en el lifespan, no al importar.                    |
 
 ---
 
@@ -70,6 +72,7 @@ app/
     circuit_breaker.py       closed / open / half-open
     audit.py                 cola + worker de auditoría de streams
     ml_model.py              carga + versioning
+    train.py                 genera los artefactos v1/v2 (corre en el build de la imagen)
     cache.py                 wrapper de Redis (cache + locks)
     inference_service.py     cache -> single-flight -> LLM
     single_flight.py         coalescing en proceso
@@ -79,8 +82,8 @@ tests/
 ### Ciclo de vida
 
 Todo lo costoso ocurre **una vez** en el `lifespan`: pool de Redis, cliente HTTP del proveedor
-(pool keep-alive), circuit breaker, rate limiter, servicio de inferencia y worker de auditoría. Las rutas sólo leen singletons de
-`app.state`. `create_app()` recibe dependencias opcionales (Redis, proveedor, breaker) → los tests
+(pool keep-alive), circuit breaker, rate limiter, servicio de inferencia, worker de auditoría y
+carga de los modelos ML. Las rutas sólo leen singletons de `app.state`. `create_app()` recibe dependencias opcionales (Redis, proveedor, breaker) → los tests
 inyectan fakeredis y un proveedor mock con contador de llamadas.
 
 ### Auth y rate limit como _dependencias_, no como middleware global
@@ -215,6 +218,62 @@ latencia o memoria no acotada en el camino del usuario. En el shutdown se drena 
 5 s). Si la auditoría fuera requisito legal (_at-least-once_), usaría outbox transaccional o Kafka
 con acks.
 
+### R3 — `/v1/classify` (modelo ML embebido)
+
+**Runtime: scikit-learn.** El enunciado acepta sklearn, ONNX o stub; lo que se evalúa es _cómo se
+carga y sirve_. Elegí un modelo real (no stub) para que las dos versiones den resultados
+distintos de verdad y para que la carga y la inferencia tengan el costo de CPU que un stub
+escondería. `app/core/train.py` entrena dos pipelines sobre un dataset chico y sintético de
+sentimiento (`positive` / `negative`):
+
+- **v1:** TF-IDF de palabras (1-2 gramas) + Logistic Regression.
+- **v2:** TF-IDF de palabras + n-gramas de caracteres (más robusto a typos y flexiones) + LogReg.
+
+**Artefactos construidos en el build** de la imagen (`RUN python -m app.core.train`): el contenedor
+arranca con los `.joblib` listos y la API sólo los _carga_; nunca entrena al arrancar. En
+producción el artefacto vendría de un model registry (MLflow, S3 versionado) y se descargaría en
+un init container. Fuera de Docker: `make models`.
+
+**Carga única al arranque, sin bloquear el loop.** En el `lifespan`:
+`asyncio.gather(to_thread(load v1), to_thread(load v2))` + una predicción de _warm-up_ por versión
+(la primera inferencia no paga inicialización perezosa). Deserializar es disco + CPU: hecho en el
+loop, frenaría el arranque de los demás componentes. Las rutas sólo leen el `ModelRegistry` de `app.state`. Test:
+`test_models_are_loaded_once_not_per_request` cuenta 2 cargas aunque haya 20 requests.
+
+**Fail-fast.** Si falta un artefacto, la app **no arranca** (`FileNotFoundError` en el lifespan).
+Prefiero un pod que no pasa el healthcheck a uno que acepta tráfico y responde 500 en
+`/v1/classify`.
+
+**Inferencia fuera del event loop.** `predict_proba` es CPU-bound: corre en un
+`ThreadPoolExecutor` **dedicado** (`ML_THREADS`, default 2) vía `run_in_executor`. No uso el
+threadpool default de anyio porque lo comparten las dependencias sync de FastAPI y un pico de
+clasificaciones las dejaría sin threads. sklearn/NumPy liberan el GIL en buena parte del trabajo
+numérico, así que los threads alcanzan para un modelo de ~1 ms; para modelos pesados usaría
+`ProcessPoolExecutor` u ONNX Runtime (libera el GIL completamente). Test
+`test_inference_does_not_block_event_loop`: una predicción que tarda 300 ms no impide que el loop
+siga atendiendo otras corrutinas.
+
+**Versionado por header.** `X-Model-Version: v1 | v2`, case-insensitive; sin header se usa
+`DEFAULT_MODEL_VERSION=v1` (los clientes existentes no se rompen cuando aparece una versión
+nueva). Versión inexistente → 400
+`{"error": "unknown_model_version", "message": "model version 'v3' not available; use one of ['v1', 'v2']"}`.
+Las versiones disponibles se configuran con `MODEL_VERSIONS` y cada una se carga en memoria al
+arranque: cambiar de versión es un lookup en un dict, sin I/O.
+
+**Auth sí, rate limit no.** `/v1/classify` exige `X-API-Key`, pero no consume la cuota de 60
+req/min: esa cuota protege al LLM (costo por token y latencia de segundos) y la clasificación es
+inferencia local de ~1 ms. Si hiciera falta limitarla, es un `Depends(enforce_rate_limit)`.
+
+**Respuesta.** `latency_ms` mide la inferencia del lado del servidor (resolución de versión +
+predicción), igual que en `/v1/infer`. `confidence` es la probabilidad de la clase elegida,
+redondeada a 4 decimales.
+
+**Seguridad.** joblib usa pickle: deserializar un artefacto ajeno es ejecución de código. Sólo
+cargamos artefactos que genera nuestro propio build; para artefactos de terceros o de un registry
+compartido usaría ONNX (formato sin código ejecutable) o verificación de firma.
+
+**Fuera de alcance (bonus):** batching dinámico de requests concurrentes por ventana de 10 ms.
+
 ---
 
 ## Plan por etapas
@@ -272,7 +331,8 @@ Cadena de defensa:
    en vez de acumular corrutinas y conexiones esperando 30 s cada una (lo que tumba un servicio no
    es el proveedor caído, sino los recursos retenidos esperándolo).
 3. **Lo que no depende del LLM sigue funcionando:** los cache hits de `/v1/infer` se siguen
-   sirviendo con el circuito abierto: el cache se consulta antes de pasar por el breaker.
+   sirviendo con el circuito abierto: el cache se consulta antes de pasar por el breaker; y
+   `/v1/classify` no se entera, porque el modelo corre dentro del proceso.
 4. **Recuperación controlada:** HALF-OPEN deja pasar una sola prueba; no se golpea al proveedor con
    todo el tráfico acumulado en el instante en que vuelve.
 5. El single-flight (escenario A) evita que N requests idénticos se conviertan en N timeouts.

@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -60,6 +61,13 @@ class Settings(BaseSettings):
     audit_stream_key: str = "audit:streams"
     audit_stream_maxlen: int = 100_000
 
+    # --- ML ----------------------------------------------------------------
+    # Artefactos `classifier-{version}.joblib` (se generan con `python -m app.core.train`).
+    models_dir: str = "models"
+    model_versions: str = "v1,v2"
+    default_model_version: str = "v1"
+    ml_threads: int = Field(default=2, ge=1)
+
     # ----------------------------------------------------------------------
     @property
     def api_key_map(self) -> dict[str, str]:
@@ -75,6 +83,10 @@ class Settings(BaseSettings):
     @property
     def allowed_models_set(self) -> set[str]:
         return {m.strip() for m in self.allowed_models.split(",") if m.strip()}
+
+    @property
+    def model_versions_list(self) -> list[str]:
+        return [v.strip() for v in self.model_versions.split(",") if v.strip()]
 
 
 @lru_cache

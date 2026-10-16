@@ -7,6 +7,8 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY app ./app
+# Los artefactos del modelo se construyen en el build: el contenedor sólo los carga.
+RUN python -m app.core.train --out /srv/models
 
 RUN useradd --create-home --uid 10001 appuser
 USER appuser

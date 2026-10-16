@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import fakeredis
 import httpx
@@ -8,6 +9,7 @@ from asgi_lifespan import LifespanManager
 
 from app.config import Settings
 from app.core.llm_client import MockProvider
+from app.core.train import train
 from app.main import create_app
 
 API_KEY = "test-key"
@@ -32,11 +34,19 @@ class TrackingProvider(MockProvider):
             self.stream_closed.set()
 
 
+@pytest.fixture(scope="session")
+def models_dir(tmp_path_factory) -> Path:
+    path = tmp_path_factory.mktemp("models")
+    train(path, ["v1", "v2"])
+    return path
+
+
 @pytest.fixture
-def settings() -> Settings:
+def settings(models_dir) -> Settings:
     return Settings(
         api_keys=f"{API_KEY}:client-test,{OTHER_KEY}:client-other",
         rate_limit_per_minute=1000,
+        models_dir=str(models_dir),
         mock_llm_latency_ms=20,
         mock_llm_token_delay_ms=1,
         llm_default_timeout_s=5,

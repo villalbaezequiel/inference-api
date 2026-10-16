@@ -1,7 +1,7 @@
 # AI Inference API
 
-API de inferencia para LLMs con streaming SSE, rate limiting, cache, circuit breaker.
-FastAPI + Redis.
+API de inferencia para LLMs con streaming SSE, rate limiting, cache, circuit breaker y un
+clasificador ML embebido. FastAPI + Redis + scikit-learn.
 
 ## Levantar
 
@@ -62,7 +62,27 @@ Mismo body, auth y rate limit que `/v1/infer`. Errores del LLM durante el stream
 `curl` con Ctrl+C cancela la generación upstream. Cada stream se audita en el Redis Stream
 `audit:streams`.
 
-### `POST /v1/classify` — clasificación con modelo ML embebido (TBD)
+### `POST /v1/classify` — clasificación con modelo ML embebido
+
+```bash
+curl -s -X POST localhost:8000/v1/classify \
+  -H 'X-API-Key: dev-key-123' -H 'X-Model-Version: v2' -H 'Content-Type: application/json' \
+  -d '{"input": "excelente servicio, lo recomiendo"}'
+```
+
+```json
+{"label": "positive", "confidence": 0.7303, "model_version": "v2", "latency_ms": 3}
+```
+
+`X-Model-Version`: `v1` (default si no se envía) o `v2`. Versión inexistente:
+
+```bash
+curl -s -X POST localhost:8000/v1/classify -H 'X-API-Key: dev-key-123' \
+  -H 'X-Model-Version: v9' -H 'Content-Type: application/json' -d '{"input": "x"}'
+# 400 {"error": "unknown_model_version", "message": "model version 'v9' not available; use one of ['v1', 'v2']"}
+```
+
+Los modelos se entrenan en el build de la imagen y se cargan una vez al arranque.
 
 ### `GET /health` — healthcheck
 
@@ -83,6 +103,7 @@ make lint           # ruff
 Correr la app fuera de Docker (con un Redis local en :6379):
 
 ```bash
+make models         # genera los artefactos del clasificador en ./models
 uvicorn --factory app.main:create_app --reload
 ```
 
@@ -95,6 +116,7 @@ app/
   api/middleware/       auth.py, rate_limit.py
   core/llm_client.py    llm_client
   core/ml_model.py      ml_model
+  core/train.py         entrenamiento de los artefactos v1/v2
   core/cache.py         cache
 tests/                  tests
 DECISIONS.md            ← el documento importante
