@@ -1,5 +1,6 @@
 """Punto de entrada. `create_app()` permite inyectar dependencias en tests."""
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -24,6 +25,9 @@ from app.core.llm_client import (
     build_provider,
 )
 from app.core.ml_model import ModelRegistry, UnknownModelVersion
+from app.logging_config import configure_logging
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -33,6 +37,7 @@ def create_app(
     breaker: CircuitBreaker | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
+    configure_logging(settings.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -53,6 +58,7 @@ def create_app(
         await audit.start()
 
         app.state.settings = settings
+        app.state.redis = r
         app.state.llm_client = llm
         app.state.model_registry = registry
         app.state.audit_writer = audit
@@ -65,6 +71,7 @@ def create_app(
             settings.single_flight_lock_ttl_s,
             settings.single_flight_wait_s,
         )
+        logger.info("startup complete")
         try:
             yield
         finally:
@@ -73,6 +80,7 @@ def create_app(
             await llm.aclose()
             if redis is None:
                 await r.aclose()
+            logger.info("shutdown complete")
 
     app = FastAPI(title="AI Inference API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(RequestContextMiddleware)

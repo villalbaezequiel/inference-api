@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -54,3 +56,10 @@ class ClassifyResponse(BaseModel):
     confidence: float
     model_version: str
     latency_ms: int
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok", "degraded"]
+    redis: Literal["ok", "error"]
+    llm_circuit: Literal["closed", "open", "half-open"]
+    models_loaded: list[str]

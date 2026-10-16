@@ -1,6 +1,6 @@
 import time
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request
 
 from app.api.deps import get_model_registry
 from app.api.middleware.auth import require_api_key
@@ -21,12 +21,14 @@ router = APIRouter(prefix="/v1", tags=["classification"])
 )
 async def classify(
     body: ClassifyRequest,
+    request: Request,
     x_model_version: str | None = Header(default=None, alias="X-Model-Version"),
     registry: ModelRegistry = Depends(get_model_registry),
 ) -> ClassifyResponse:
     start = time.perf_counter()
     version = registry.resolve(x_model_version)  # 400 si no existe (exception handler)
     label, confidence = await registry.classify(body.input, version)
+    request.state.log_extra = {"model": "classifier", "model_version": version, "cache_hit": False}
     return ClassifyResponse(
         label=label,
         confidence=round(confidence, 4),

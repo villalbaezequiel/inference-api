@@ -9,6 +9,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    log_level: str = "INFO"
+
     # --- Redis -------------------------------------------------------------
     redis_url: str = "redis://localhost:6379/0"
     # Timeouts cortos: Redis está en el camino crítico de cada request.
