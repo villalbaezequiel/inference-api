@@ -3,9 +3,9 @@
 Documento de arquitectura y trade-offs. Está escrito para que un TL entienda **qué**
 hice, **por qué** y **qué dejé afuera a propósito**. Se actualiza en cada etapa.
 
-> Estado: **etapa 3 — R3**. `/v1/classify` con modelo scikit-learn embebido (v1 y v2), cargado una
-> vez al arranque y servido fuera del event loop; escenarios A, B y C. Las decisiones de abajo son el
-> diseño de partida; cada etapa las confirma o corrige.
+> Estado: **etapa 4 — observabilidad y tests**. R1, R2 y R3 completos; tests del circuit breaker,
+> healthcheck completo (`redis`, `llm_circuit`, `models_loaded`) y logs JSON estructurados por
+> request. Las decisiones de abajo son el diseño de partida; cada etapa las confirma o corrige.
 
 ---
 
@@ -25,6 +25,8 @@ hice, **por qué** y **qué dejé afuera a propósito**. Se actualiza en cada et
 | Auditoría           | Cola acotada + worker en background → Redis Stream                       | `put_nowait` nunca bloquea el response; si se satura, se descarta y se loguea.                             |
 | Modelo ML           | scikit-learn, artefactos generados en el **build**, carga en el lifespan | Una sola carga por proceso vía `to_thread`; si falta un artefacto la app no arranca.                       |
 | Inferencia ML       | `ThreadPoolExecutor` **dedicado**                                        | CPU-bound fuera del event loop; no compite con el threadpool default de anyio.                             |
+| Logs                | JSON a stdout, **una línea por request** desde el middleware ASGI         | Campos mínimos del enunciado en un solo lugar; las rutas sólo aportan contexto (`model`, `cache_hit`).     |
+| Healthcheck         | `degraded` con **200** si Redis o el circuito fallan; **503** sin modelos | La API sigue sirviendo degradada; sólo un pod sin modelos debe salir del balanceo.                         |
 | App factory         | `create_app()` + `uvicorn --factory`                                     | Cada test crea una app aislada; el estado se inicializa en el lifespan, no al importar.                    |
 
 ---
@@ -61,12 +63,13 @@ cliente ──HTTP──▶ FastAPI (1 proceso por contenedor)
 app/
   main.py                    create_app(), lifespan, handlers de error
   config.py                  Settings (todo por env)
+  logging_config.py          formatter JSON + contextvars (request_id, client_id)
   schemas.py                 modelos Pydantic de request/response
   api/
     deps.py                  acceso a singletons de app.state
     sse.py                   SSEResponse: desconexión, slow consumer, cierre determinístico
     routes/                  infer.py, stream.py, classify.py, health.py
-    middleware/              auth.py, rate_limit.py, request_context.py
+    middleware/              auth.py, rate_limit.py, request_context.py (request_id + log de acceso)
   core/
     llm_client.py            abstracción del proveedor + timeouts
     circuit_breaker.py       closed / open / half-open
@@ -92,7 +95,7 @@ Respeté los archivos `middleware/auth.py` y `rate_limit.py` pero los implement�
 de FastAPI porque: (1) aplican sólo a las rutas que las declaran (`/health` queda público para el
 orquestador), (2) se encadenan: auth resuelve el `client_id` y el rate limit lo recibe tipado,
 (3) aparecen en OpenAPI (botón _Authorize_ en `/docs`) y (4) son triviales de overridear en tests.
-El único middleware real es `RequestContextMiddleware` (asigna `request_id`), y es **ASGI puro**
+El único middleware real es `RequestContextMiddleware` (asigna `request_id` y emite el log de acceso), y es **ASGI puro**
 porque `BaseHTTPMiddleware` bufferiza y rompería la desconexión de SSE en R2.
 
 ---
@@ -196,7 +199,8 @@ mientras el generador está suspendido.
 - Sin locks: todas las transiciones ocurren sin `await` intermedio → atómicas en el event loop.
 - `retry_after_s` = tiempo restante del OPEN (el ejemplo `45` del enunciado = 15 s después de
   abrir).
-- Reloj inyectable → testeable de forma determinística sin `sleep` (tests en etapa 4).
+- Reloj inyectable → testeable de forma determinística sin `sleep` (`FakeClock` de
+  `tests/conftest.py`; `tests/test_circuit_breaker.py` cubre las transiciones y la integración HTTP y SSE).
 
 **Trade-off: breaker por proceso, no compartido.** Con N réplicas, cada una abre su circuito tras
 _sus_ 5 fallos: el proveedor caído recibe hasta 5·N requests antes de que todo el cluster falle
@@ -276,6 +280,44 @@ compartido usaría ONNX (formato sin código ejecutable) o verificación de firm
 
 ---
 
+## Observabilidad
+
+**Logs estructurados.** `configure_logging()` instala un único handler JSON a stdout (también para
+los loggers de uvicorn; su access log se silencia porque duplica el nuestro). Cada request produce
+**una** línea `app.access` emitida por `RequestContextMiddleware` al terminar:
+
+```json
+{"timestamp": "2026-10-16T20:59:11.673342+00:00", "level": "INFO", "logger": "app.access",
+ "message": "request completed", "request_id": "07161888-...", "client_id": "client-demo",
+ "model": "gpt-4o", "latency_ms": 167, "cache_hit": false, "status": "success",
+ "endpoint": "/v1/infer", "http_status": 200, "tokens_in": 1, "tokens_out": 20}
+```
+
+- `request_id` y `client_id` viajan en `contextvars`: cualquier log emitido durante el request
+  (cache, breaker, rate limit) sale con ambos sin pasarlos a mano.
+- Las rutas aportan el contexto de negocio en `request.state.log_extra` (`model`, `cache_hit`,
+  tokens); el middleware agrega `latency_ms` y deriva `status` del código HTTP
+  (`2xx/3xx → success`, `504 → timeout`, resto → `error`).
+- En `/v1/stream` el status HTTP siempre es 200: el generador escribe el resultado real
+  (`success | timeout | error | cancelled`) antes de que el middleware loguee, y la latencia
+  incluye todo el stream.
+- `/health` no se loguea: lo sondea el orquestador cada pocos segundos y sólo agrega ruido.
+- Nivel por `LOG_LEVEL` (default `INFO`).
+
+**Healthcheck.** `GET /health` → `{"status", "redis", "llm_circuit", "models_loaded"}`.
+
+| Situación                     | `status`   | HTTP | Por qué                                                               |
+| ----------------------------- | ---------- | ---- | --------------------------------------------------------------------- |
+| Todo bien                     | `ok`       | 200  |                                                                       |
+| Redis sin respuesta en 0.5 s  | `degraded` | 200  | Cache y rate limit son fail-open: el pod sigue siendo útil.           |
+| Circuito `open` o `half-open` | `degraded` | 200  | Sacar el pod no arregla al proveedor; `/classify` y cache hits andan. |
+| Falta un modelo configurado   | —          | 503  | El pod no puede cumplir su contrato: que no reciba tráfico.           |
+
+Si un Redis o un proveedor caído hicieran fallar el health, el orquestador reiniciaría **todas** las
+réplicas a la vez por una dependencia externa: una falla parcial se convertiría en total.
+
+---
+
 ## Plan por etapas
 
 | Etapa  | Alcance                                                                                                                               |
@@ -284,7 +326,7 @@ compartido usaría ONNX (formato sin código ejecutable) o verificación de firm
 | 1 — R1 | `/v1/infer`: auth `X-API-Key`, rate limit 60 req/min en Redis, cache con TTL configurable                                             |
 | 2 — R2 | `/v1/stream`: SSE, cancelación upstream, timeout por request, circuit breaker (5 fallos/30 s → abierto 60 s), auditoría en background |
 | 3 — R3 | `/v1/classify`: modelo cargado una vez sin bloquear el loop, routing por `X-Model-Version`                                            |
-| 4      | Tests de circuit breaker, healthcheck completo, logs JSON, métricas Prometheus                                                        |
+| 4      | Tests de circuit breaker, healthcheck completo, logs JSON                                                                             |
 | 5      | Completar DECISIONS, verificar `docker compose up`                                                                                    |
 
 ---
