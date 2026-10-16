@@ -10,7 +10,10 @@ docker compose up --build
 ```
 
 - API: http://localhost:8000 · Swagger: http://localhost:8000/docs
-- Variables configurables: ver [`.env.example`](.env.example)
+- Variables configurables: ver [`.env.example`](.env.example). Con `docker compose` sólo se pasan al
+  contenedor `LLM_PROVIDER`, `OPENAI_API_KEY`, `API_KEYS`, `RATE_LIMIT_PER_MINUTE` y `CACHE_TTL_S`
+  (tomadas de un `.env` en la raíz o del entorno); el resto aplica al correr la app fuera de Docker.
+- API keys de desarrollo: `dev-key-123` (`client-demo`) y `dev-key-456` (`client-b`).
 
 ## Endpoints
 
@@ -24,7 +27,7 @@ curl -s -X POST localhost:8000/v1/infer \
 
 ```json
 {"request_id": "5c1d...", "output": "...", "model": "gpt-4o",
- "usage": {"tokens_in": 9, "tokens_out": 21}, "latency_ms": 154, "cache_hit": false}
+ "usage": {"tokens_in": 8, "tokens_out": 21}, "latency_ms": 154, "cache_hit": false}
 ```
 
 Repetir el mismo request devuelve `"cache_hit": true`. Modelos permitidos: `gpt-4o`, `gpt-4o-mini`
@@ -37,9 +40,25 @@ Rate limit: 60 req/min por API key. Al excederlo:
 ```
 
 Errores (formato `{"error": ..., ...}`): 401 `missing_api_key` / `invalid_api_key`,
-400 `unsupported_model`, 422 `invalid_request`, 429 `rate_limit_exceeded`, 502 `llm_upstream_error`,
+400 `unsupported_model` / `llm_rejected_request` (el proveedor rechazó el request), 422 `invalid_request`, 429 `rate_limit_exceeded`, 502 `llm_upstream_error`,
 503 `llm_unavailable` (circuit breaker abierto), 504 `llm_timeout`. `config.timeout_s` fija el
 timeout por request (default 30 s, máximo 120 s).
+
+Probar el circuit breaker con el proveedor mock: un input con `__fail__` simula un 503 del
+proveedor (`__slow__` lo hace 10× más lento). Tras 5 fallos en 30 s el circuito se abre por 60 s:
+
+```bash
+for i in 1 2 3 4 5 6; do
+  curl -s -X POST localhost:8000/v1/infer -H 'X-API-Key: dev-key-123' -H 'Content-Type: application/json' \
+    -d "{\"model\": \"gpt-4o\", \"input\": \"__fail__ $i\"}"; echo
+done
+# 1-5: 502 {"error": "llm_upstream_error", ...}
+# 6:   503 {"error": "llm_unavailable", "retry_after_s": 60}
+curl -s localhost:8000/health   # "status": "degraded", "llm_circuit": "open"
+```
+
+Mientras el circuito está abierto, los requests que necesitan al LLM responden 503 (los cache hits
+y `/v1/classify` siguen funcionando).
 
 ### `POST /v1/stream` — streaming SSE
 
@@ -58,7 +77,7 @@ data: [DONE]
 ```
 
 Mismo body, auth y rate limit que `/v1/infer`. Errores del LLM durante el stream llegan como evento
-(`data: {"error": "llm_unavailable", "retry_after_s": 45}`, `llm_timeout`, `llm_error`). Cortar el
+(`data: {"error": "llm_unavailable", "retry_after_s": 45}`, `llm_timeout`, `llm_rejected_request`, `llm_error`). Cortar el
 `curl` con Ctrl+C cancela la generación upstream. Cada stream se audita en el Redis Stream
 `audit:streams`.
 
@@ -116,8 +135,7 @@ make load           # locust headless 60 s a ~105 RPS contra docker compose
 ```
 
 Levanta la app con rate limit alto (para medir capacidad, no el limitador) y deja CSV y
-`report.html` en `loadtest/results/`. Interactivo: `docker compose --profile load up locust` →
-http://localhost:8089. Resultado de referencia: 102.6 RPS, 0 errores
+`report.html` en `loadtest/results/`. Resultado de referencia: 102.6 RPS, 0 errores
 ([RESULTS.md](loadtest/results/RESULTS.md)).
 
 ## Desarrollo
@@ -140,14 +158,26 @@ uvicorn --factory app.main:create_app --reload
 
 ```
 app/
-  main.py               app
-  api/routes/           infer.py, stream.py, classify.py, health.py, metrics.py
-  api/middleware/       auth.py, rate_limit.py
-  core/llm_client.py    llm_client
-  core/ml_model.py      ml_model
-  core/train.py         entrenamiento de los artefactos v1/v2
-  core/cache.py         cache
-tests/                  tests
-loadtest/               locustfile + resultados
-DECISIONS.md            ← el documento importante
+  main.py                  create_app(), lifespan, handlers de error
+  config.py                settings (todo por variables de entorno)
+  schemas.py               modelos Pydantic de request/response
+  logging_config.py        logs JSON + contexto por request
+  metrics.py               métricas Prometheus
+  api/
+    deps.py                acceso a los singletons del lifespan
+    sse.py                 respuesta SSE (desconexión, slow consumer)
+    routes/                infer.py, stream.py, classify.py, health.py, metrics.py
+    middleware/            auth.py, rate_limit.py, request_context.py
+  core/
+    llm_client.py          abstracción del proveedor (mock / OpenAI) + timeouts
+    circuit_breaker.py     closed / open / half-open
+    inference_service.py   cache -> single-flight -> LLM
+    single_flight.py       coalescing de requests idénticos
+    cache.py               wrapper de Redis (cache + locks)
+    audit.py               auditoría de streams en background
+    ml_model.py            carga + versionado del clasificador
+    train.py               entrenamiento de los artefactos v1/v2
+tests/                     pytest + pytest-asyncio
+loadtest/                  locustfile + resultados
+DECISIONS.md               arquitectura, trade-offs y escenarios de carga
 ```

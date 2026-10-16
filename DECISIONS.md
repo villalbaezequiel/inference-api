@@ -3,9 +3,10 @@
 Documento de arquitectura y trade-offs. Está escrito para que un TL entienda **qué**
 hice, **por qué** y **qué dejé afuera a propósito**. Se actualiza en cada etapa.
 
-> Estado: **etapa 4 — observabilidad y tests**. R1, R2 y R3 completos; tests del circuit breaker,
-> healthcheck completo (`redis`, `llm_circuit`, `models_loaded`) y logs JSON estructurados por
-> request. Bonus: métricas Prometheus en `GET /metrics` y carga con locust (102 RPS, 0 errores). Las decisiones de abajo son el diseño de partida; cada etapa las confirma o corrige.
+> Estado: **etapa 5 — entrega final**. R1, R2 y R3 completos; escenarios de carga A, B y C
+> implementados y testeados; healthcheck, logs JSON y tests (44, `ruff` limpio). Bonus: métricas
+> Prometheus en `GET /metrics` y carga con locust (102 RPS, 0 errores). `docker compose up`
+> levanta app + Redis sin configuración adicional.
 
 ---
 
@@ -347,6 +348,8 @@ Resultado: **102.6 RPS, 0 errores**, P50 47 ms, P95 210 ms; cache hit ratio 69 %
 
 ## Plan por etapas
 
+Todas completas; de la 1 en adelante cada etapa es una rama con su PR, para que el historial muestre el proceso.
+
 | Etapa  | Alcance                                                                                                                               |
 | ------ | ------------------------------------------------------------------------------------------------------------------------------------- |
 | 0      | Esqueleto, Docker, `/health`, DECISIONS inicial                                                                                       |
@@ -433,6 +436,93 @@ que proxies con idle-timeout no corten la conexión y para detectar antes client
 
 ---
 
-## Levantar el proyecto
+## Matriz de fallas
 
-Ver [README](README.md).
+| Falla                            | Comportamiento                                                                                                                    | Resultado para el cliente     |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| Redis caído                      | Rate limit **fail-open** (`RATE_LIMIT_FAIL_OPEN`), cache = miss, lock = llamada directa, auditoría descartada y logueada          | La API sigue sirviendo        |
+| Redis lento                      | Timeout de socket de 250 ms por operación, sin reintentos                                                                         | +≤ 250 ms por operación       |
+| Proveedor 5xx / 429 / transporte | Cuenta para el breaker                                                                                                            | 502 `llm_upstream_error`      |
+| Proveedor timeout                | Cuenta para el breaker                                                                                                            | 504 `llm_timeout` / evento SSE |
+| Proveedor 4xx (request inválido) | **No** cuenta para el breaker                                                                                                     | 400 `llm_rejected_request`    |
+| Circuito abierto                 | Rechazo inmediato sin tocar al proveedor; los cache hits se siguen sirviendo                                                      | 503 `llm_unavailable`         |
+| Cliente se desconecta            | Cancelación upstream inmediata; auditado como `client_disconnected`; no cuenta para el breaker                                    | —                             |
+| Falta un artefacto ML            | La app no arranca                                                                                                                 | Pod fuera del balanceo        |
+
+**Sin reintentos hacia Redis:** redis-py reintenta por defecto los errores de conexión con
+backoff exponencial, lo que con Redis caído suma segundos a cada operación. Configuré
+`retry=Retry(NoBackoff(), 0)` (`core/cache.py`): dentro de un presupuesto de 200 ms conviene fallar
+rápido y degradar, no reintentar. `test_redis_down_fails_open` cubre el camino degradado.
+
+_Pendiente:_ con Redis **colgado** (acepta conexiones pero no responde) cada request pagaría hasta
+3 × 250 ms (rate limit + cache + lock). Lo resolvería con un circuit breaker también delante de
+Redis (el mismo `CircuitBreaker` sirve) para saltearlo mientras esté caído.
+
+---
+
+## Escalado y capacidad
+
+- **Horizontal:** la API es stateless salvo estado _derivable_ en proceso (breaker, single-flight).
+  Todo lo que debe ser consistente entre réplicas (rate limit, cache, locks) vive en Redis. Se
+  escala con réplicas detrás de un load balancer, **1 worker uvicorn por contenedor** para que
+  "proceso" = "réplica" y el estado y las métricas sean coherentes por pod.
+- **Una réplica** sostuvo **102 RPS con 0 errores** (locust en la misma máquina, CPU compartida).
+  Para 300 req/s base estimo 3–4 réplicas con margen; para picos de miles, autoscaling por CPU y
+  por streams activos (un stream retiene la conexión mucho más que un request sync).
+- **El cuello de botella real es el proveedor LLM** (latencia y rate limits propios), no la API.
+  Por eso las palancas importantes son cache, single-flight y breaker, no micro-optimizar FastAPI.
+- **Redis:** un cache hit hace 2 operaciones (rate limit + `GET`); un miss suma lock, double-check,
+  `SET` y liberación del lock. Es poco frente a la capacidad de una instancia. Para HA, Sentinel/Cluster
+  o un servicio administrado; ninguna operación es multi-key, así que se puede shardear sin
+  cambios de código.
+- **Límites explícitos:** pools de conexiones a Redis y al proveedor OpenAI (200), cola de
+  auditoría (10k), timeout máximo por request (120 s), stall timeout de SSE (10 s). Falta **load
+  shedding** global (p. ej. tope de streams concurrentes por réplica con un semáforo → 503 antes de
+  degradar a todos).
+- **SLA 99.9 %:** el código evita que una dependencia caída tire el servicio (fail-open, breaker,
+  health que no reinicia pods por fallas externas). El resto es infraestructura: ≥ 2 réplicas en
+  zonas distintas, graceful shutdown y despliegues rolling.
+
+---
+
+## Lo que dejé afuera a propósito
+
+| Tema                                | Por qué no ahora                                                                    | Cómo lo haría                                                                                |
+| ----------------------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Batching dinámico en `/v1/classify` | Bonus; con un modelo de ~1 ms el overhead por request ya es bajo                    | Cola por versión que acumula requests 10 ms (o hasta N) y hace un solo `predict_proba`       |
+| Cache semántico real                | El enunciado lo define como exact-match; suma embeddings al camino crítico          | Embedding del prompt + búsqueda ANN (Redis Vector / pgvector) con umbral alto, sólo `temperature == 0` |
+| Breaker compartido entre réplicas   | Trade-off explicado en R2                                                           | ZSET de fallos + `open_until` en Redis, con caché local de 1 s                               |
+| Breaker delante de Redis            | Tiempo                                                                              | Reusar `CircuitBreaker`                                                                      |
+| Fallback de proveedor               | No hay un segundo proveedor real                                                    | `FallbackProvider([primary, secondary])` con un breaker por proveedor                        |
+| Heartbeats SSE                      | Tiempo                                                                              | `: ping` cada 15 s mientras se espera el próximo token                                      |
+| Cuota por tokens                    | Fuera de alcance                                                                    | Rate limit por `tokens_in + tokens_out` con reserva y ajuste post-respuesta                  |
+| API keys hasheadas, scopes          | Fuera de alcance                                                                    | DB / secret manager + caché local con TTL                                                    |
+| Tracing distribuido                 | Fuera de alcance                                                                    | OpenTelemetry (FastAPI, httpx, redis); el `request_id` ya se propaga                         |
+| Auditoría con garantía de entrega   | Trade-off explicado en R2                                                           | Outbox transaccional / Kafka con acks                                                        |
+
+---
+
+## Cómo verificar
+
+```bash
+docker compose up --build   # app + Redis, sin configuración; GET /health → "ok"
+make test                   # 44 tests (fakeredis, no requiere Redis)
+make lint                   # ruff check + format
+make load                   # bonus: locust 60 s (~105 RPS)
+```
+
+Para ver el breaker sin un proveedor real, el mock reconoce `__fail__` (503 upstream) y `__slow__`
+(10× más lento) en el input. Ejemplos de cada endpoint en el [README](README.md).
+
+**Mapa de tests:**
+
+- `test_infer.py` (R1): auth, forma de la respuesta, cache hit y TTL configurable, rate limit (429 +
+  `Retry-After`, por cliente), thundering herd en proceso y entre réplicas, Redis caído (fail-open).
+- `test_circuit_breaker.py` (R2): todas las transiciones con reloj falso, half-open de prueba única,
+  cancelaciones y 4xx que no cuentan, integración HTTP (503 + `retry_after_s`), cache hits con
+  circuito abierto, recuperación, timeouts que abren el circuito, evento SSE.
+- `test_stream.py` (R2): formato SSE, auth, auditoría en background, timeout, **desconexión que
+  cancela upstream**, **slow consumer**.
+- `test_classify.py` (R3): versiones, default, case-insensitive, 400, auth, carga única, fail-fast
+  sin artefactos, inferencia que no bloquea el loop.
+- `test_health.py`: health `ok` / `degraded`, campos obligatorios del log estructurado, métricas.

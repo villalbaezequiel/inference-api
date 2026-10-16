@@ -25,7 +25,7 @@ services:
       redis:
         condition: service_healthy
 
-  # Bonus: `make load` (headless) o `docker compose --profile load up locust` -> http://localhost:8089
+  # Bonus: `make load` (locust headless, resultados en loadtest/results/)
   locust:
     profiles: ["load"]
     image: locustio/locust:2.46.7
