@@ -3,23 +3,27 @@
 Documento de arquitectura y trade-offs. Está escrito para que un TL entienda **qué**
 hice, **por qué** y **qué dejé afuera a propósito**. Se actualiza en cada etapa.
 
-> Estado: **etapa 1 — R1**. `/v1/infer` con auth, rate limit, cache y escenario A (thundering
-> herd). Las decisiones de abajo son el diseño de partida; cada etapa las confirma o corrige.
+> Estado: **etapa 2 — R2**. `/v1/stream` (SSE) con cancelación upstream, timeout por request,
+> circuit breaker y auditoría en background; escenarios A, B y C. Las decisiones de abajo son el
+> diseño de partida; cada etapa las confirma o corrige.
 
 ---
 
 ## TL
 
-| Tema                | Decisión                                                            | Por qué                                                                                                    |
-| ------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| Framework / runtime | FastAPI + uvicorn (uvloop, httptools), **1 worker por contenedor**  | El estado en proceso (circuit breaker, coalescing) es por proceso; se escala con réplicas, no con workers. |
-| HTTP client         | `httpx.AsyncClient` compartido (pool de conexiones)                 | Async nativo, timeouts por request, sin `requests` sincrónico.                                             |
-| LLM                 | Interfaz de proveedor con **mock por default**                      | `docker compose up` funciona sin credenciales; la capa HTTP no conoce al proveedor.                        |
-| Fallas de Redis     | **Fail-open** (cache = miss, rate limit = permitir)                 | Perder cache degrada costo; perder el servicio rompe el SLA de 99.9 %.                                     |
-| Rate limiting       | **Sliding window log** en Redis (no in-memory), un único script Lua | Correcto con varias réplicas; sin el "doble burst" de fixed window; atómico, 1 round-trip.                 |
-| Cache               | Exact-match sobre `sha256(modelo + input normalizado + config)`     | Determinístico y barato; cumple "mismo input + mismo modelo → misma respuesta".                            |
-| Thundering herd     | **Single-flight en 2 niveles**: en proceso + lock `SET NX PX`       | 100 requests idénticos → **1** llamada al LLM, incluso entre réplicas.                                     |
-| App factory         | `create_app()` + `uvicorn --factory`                                | Cada test crea una app aislada; el estado se inicializa en el lifespan, no al importar.                    |
+| Tema                | Decisión                                                               | Por qué                                                                                                    |
+| ------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Framework / runtime | FastAPI + uvicorn (uvloop, httptools), **1 worker por contenedor**     | El estado en proceso (circuit breaker, coalescing) es por proceso; se escala con réplicas, no con workers. |
+| HTTP client         | `httpx.AsyncClient` compartido (pool de conexiones)                    | Async nativo, timeouts por request, sin `requests` sincrónico.                                             |
+| LLM                 | Interfaz de proveedor con **mock por default**                         | `docker compose up` funciona sin credenciales; la capa HTTP no conoce al proveedor.                        |
+| Fallas de Redis     | **Fail-open** (cache = miss, rate limit = permitir)                    | Perder cache degrada costo; perder el servicio rompe el SLA de 99.9 %.                                     |
+| Rate limiting       | **Sliding window log** en Redis (no in-memory), un único script Lua    | Correcto con varias réplicas; sin el "doble burst" de fixed window; atómico, 1 round-trip.                 |
+| Cache               | Exact-match sobre `sha256(modelo + input normalizado + config)`        | Determinístico y barato; cumple "mismo input + mismo modelo → misma respuesta".                            |
+| Thundering herd     | **Single-flight en 2 niveles**: en proceso + lock `SET NX PX`          | 100 requests idénticos → **1** llamada al LLM, incluso entre réplicas.                                     |
+| Circuit breaker     | Ventana deslizante 5 fallos/30 s → OPEN 60 s → HALF-OPEN, **1** prueba | Lo pedido, con prueba única para no golpear a un proveedor que se está recuperando.                        |
+| Streaming           | `SSEResponse` propio: listener de desconexión + `send` con timeout     | Cancela el upstream **al instante** si el cliente se va; memoria por stream O(1 chunk).                    |
+| Auditoría           | Cola acotada + worker en background → Redis Stream                     | `put_nowait` nunca bloquea el response; si se satura, se descarta y se loguea.                             |
+| App factory         | `create_app()` + `uvicorn --factory`                                   | Cada test crea una app aislada; el estado se inicializa en el lifespan, no al importar.                    |
 
 ---
 
@@ -58,10 +62,13 @@ app/
   schemas.py                 modelos Pydantic de request/response
   api/
     deps.py                  acceso a singletons de app.state
+    sse.py                   SSEResponse: desconexión, slow consumer, cierre determinístico
     routes/                  infer.py, stream.py, classify.py, health.py
     middleware/              auth.py, rate_limit.py, request_context.py
   core/
-    llm_client.py            abstracción del proveedor + circuit breaker
+    llm_client.py            abstracción del proveedor + timeouts
+    circuit_breaker.py       closed / open / half-open
+    audit.py                 cola + worker de auditoría de streams
     ml_model.py              carga + versioning
     cache.py                 wrapper de Redis (cache + locks)
     inference_service.py     cache -> single-flight -> LLM
@@ -72,9 +79,9 @@ tests/
 ### Ciclo de vida
 
 Todo lo costoso ocurre **una vez** en el `lifespan`: pool de Redis, cliente HTTP del proveedor
-(pool keep-alive), rate limiter y servicio de inferencia. Las rutas sólo leen singletons de
-`app.state`. `create_app()` recibe dependencias opcionales (Redis, proveedor) → los tests inyectan
-fakeredis y un proveedor mock con contador de llamadas.
+(pool keep-alive), circuit breaker, rate limiter, servicio de inferencia y worker de auditoría. Las rutas sólo leen singletons de
+`app.state`. `create_app()` recibe dependencias opcionales (Redis, proveedor, breaker) → los tests
+inyectan fakeredis y un proveedor mock con contador de llamadas.
 
 ### Auth y rate limit como _dependencias_, no como middleware global
 
@@ -134,8 +141,79 @@ key = sha256(json({model, input: " ".join(input.split()), config: {temperature, 
 **Respuesta.** `request_id` reutiliza el `X-Request-ID` entrante si existe (trazabilidad end-to-end).
 
 **LLM.** `LLMClient` envuelve un `LLMProvider` (`MockProvider` por default, `OpenAIProvider`
-opcional con `LLM_PROVIDER=openai`). En esta etapa aplica un timeout global (`LLM_TIMEOUT_S`, 30 s):
-ninguna llamada al proveedor queda sin deadline. El timeout por request y el circuit breaker son R2.
+opcional con `LLM_PROVIDER=openai`). Ninguna llamada al proveedor queda sin deadline; desde R2 el
+timeout es por request y las llamadas pasan por el circuit breaker (ver R2).
+
+### R2 — `/v1/stream` (SSE) + resiliencia
+
+**Endpoint:** `POST /v1/stream` con el mismo body que `/v1/infer`, misma auth y mismo rate limit.
+Es POST (no GET) porque el input puede ser largo y no debe terminar en logs de proxies vía query
+string. Contrapartida: `EventSource` del browser sólo hace GET; los clientes usan `fetch` +
+`ReadableStream` (lo normal en APIs de LLM).
+
+**Formato** exactamente el pedido: `data: {"token": "...", "index": n}` … `data: [DONE]`. Los
+errores van como evento: `data: {"error": "llm_unavailable", "retry_after_s": 45}`,
+`llm_timeout`, `llm_error`. Para errores que ocurren _antes_ del primer token igual se responde
+200 + evento de error: el status HTTP ya se envió cuando arranca el stream, por eso el error de
+negocio vive en el payload. Auth, rate limit y modelo inválido sí fallan con su status (401, 429,
+400) porque se validan antes de abrir el stream.
+
+**Cancelación upstream si el cliente se desconecta — por qué un `SSEResponse` propio.** Con ASGI
+spec ≥ 2.4 (uvicorn), `StreamingResponse` de Starlette detecta la desconexión **sólo cuando falla
+el próximo `send`**. Si el LLM tarda 20 s en el próximo token, seguimos pagando 20 s de generación
+para nadie. Además, al cortar por excepción no cierra el generador de forma determinística (queda
+al GC). `SSEResponse` (`api/sse.py`):
+
+1. corre en paralelo un listener de `http.disconnect` → al llegar, cancela la tarea del stream;
+2. siempre hace `aclose()` del generador → su `finally` cierra el `async with httpx.stream(...)`
+   → **se corta la conexión TCP con el proveedor y deja de generar** (y de facturar tokens);
+3. hace cada `send` con timeout (slow consumer, ver escenario C).
+
+Test: `test_client_disconnect_cancels_upstream` desconecta tras el primer token y verifica que el
+proveedor generó ≤ 2 tokens y que la auditoría registra `client_disconnected`.
+
+**Timeout configurable por request:** `config.timeout_s` (default `LLM_DEFAULT_TIMEOUT_S=30`,
+techo `LLM_MAX_TIMEOUT_S=120` para que un cliente no pueda retener recursos indefinidamente). Aplica
+también a `/v1/infer` y no forma parte de la cache key (no cambia el output). En streaming es un
+**deadline total** (no por token), aplicado con `wait_for` sobre cada `anext()` con el tiempo
+restante — no uso `asyncio.timeout` envolviendo un `yield` porque cancelaría la tarea equivocada
+mientras el generador está suspendido.
+
+**Circuit breaker** (`core/circuit_breaker.py`):
+
+- Ventana **deslizante** de timestamps de fallo (deque): 5 fallos dentro de 30 s → OPEN 60 s.
+- Pasados los 60 s → HALF-OPEN: deja pasar **una sola** llamada de prueba; las concurrentes
+  reciben 503. Éxito → CLOSED (limpia historial); fallo → OPEN otros 60 s.
+- Cuenta como fallo: 5xx, 429 del proveedor, errores de transporte, **timeouts**. **No** cuenta:
+  4xx del proveedor por request inválido (culpa del cliente, no del proveedor) ni cancelaciones por
+  desconexión del cliente o slow consumer. Si una cancelación ocurre durante la prueba de
+  HALF-OPEN, se libera el slot para que otro request pruebe.
+- Con el circuito abierto: `/v1/infer` → 503 `{"error": "llm_unavailable", "retry_after_s": N}` +
+  header `Retry-After`; `/v1/stream` → evento SSE con el mismo payload.
+- Sin locks: todas las transiciones ocurren sin `await` intermedio → atómicas en el event loop.
+- `retry_after_s` = tiempo restante del OPEN (el ejemplo `45` del enunciado = 15 s después de
+  abrir).
+- Reloj inyectable → testeable de forma determinística sin `sleep` (tests en etapa 4).
+
+**Trade-off: breaker por proceso, no compartido.** Con N réplicas, cada una abre su circuito tras
+_sus_ 5 fallos: el proveedor caído recibe hasta 5·N requests antes de que todo el cluster falle
+rápido, y cada réplica se recupera independientemente. Lo elegí porque no agrega Redis al camino
+de cada llamada al LLM, cada réplica reacciona a lo que _ella_ ve y el costo (5·N requests extra)
+es bajo. Si el proveedor cobrara caro los fallos o N fuera grande, movería el estado a Redis
+(contador en ZSET + flag `open_until` con TTL) con un caché local de 1 s del estado para no pagar
+un RTT por request.
+
+**Auditoría sin bloquear el response.** El enunciado sugiere _background task_. Un
+`BackgroundTask` de Starlette **no corre si el cliente se desconecta** (justamente el caso que más
+interesa auditar) y además se ejecuta dentro del ciclo del request. En su lugar: el `finally` del
+generador hace `queue.put_nowait(evento)` (O(1), nunca espera) en una cola acotada; un worker
+arrancado en el lifespan la drena en lotes con un pipeline de `XADD` a un **Redis Stream**
+(`MAXLEN ~ 100k`) + una línea de log. El evento incluye input, output completo, tokens, estado
+(`success|timeout|error|cancelled`) y motivo (`client_disconnected|slow_consumer`). Si la cola se
+llena (Redis caído mucho tiempo), se descarta y se loguea: elegí perder auditoría antes que meter
+latencia o memoria no acotada en el camino del usuario. En el shutdown se drena la cola (hasta
+5 s). Si la auditoría fuera requisito legal (_at-least-once_), usaría outbox transaccional o Kafka
+con acks.
 
 ---
 
@@ -169,7 +247,7 @@ Single-flight en dos niveles (`core/single_flight.py`, `core/inference_service.p
    - Si no: hace polling del cache con backoff exponencial (20 → 200 ms). Si el lock desaparece sin
      valor en cache (el líder falló), intenta tomar el liderazgo. Si se excede el tiempo de espera o
      Redis no responde, **degrada a llamar al LLM directo** (nunca deja al cliente colgado).
-   - El TTL del lock (35 s) es mayor que el timeout del LLM (30 s), para que un líder que muere no
+   - El TTL del lock (35 s) es mayor que el timeout default del LLM (30 s), para que un líder que muere no
      bloquee la key más que eso.
 3. Los errores se comparten: si el LLM falla, los 100 reciben el mismo error en vez de reintentar
    en estampida.
@@ -181,10 +259,48 @@ _Alternativas descartadas:_ stale-while-revalidate (requiere un valor previo, no
 primer miss); _probabilistic early expiration_ (complementario: evita que todas las keys calientes
 expiren a la vez; lo agregaría junto con jitter en el TTL).
 
-### Pendientes
+### B — LLM provider down ✅ implementado
 
-- **B — LLM provider down**: a definir en etapa 2 (circuit breaker + timeouts).
-- **C — Slow consumer streaming**: a definir en etapa 2 (backpressure + cancelación).
+> El proveedor empieza a retornar timeouts. ¿Cómo falla el sistema gracefully?
+
+Cadena de defensa:
+
+1. **Deadline por request** (default 30 s, configurable): ningún request queda colgado; el cliente
+   recibe 504 `llm_timeout` (o el evento `llm_timeout` en SSE).
+2. Los timeouts **cuentan como fallos** → tras 5 en 30 s el **circuito se abre**: durante 60 s los
+   requests que necesitan al LLM responden **503 inmediato** con `retry_after_s` y `Retry-After`,
+   en vez de acumular corrutinas y conexiones esperando 30 s cada una (lo que tumba un servicio no
+   es el proveedor caído, sino los recursos retenidos esperándolo).
+3. **Lo que no depende del LLM sigue funcionando:** los cache hits de `/v1/infer` se siguen
+   sirviendo con el circuito abierto: el cache se consulta antes de pasar por el breaker.
+4. **Recuperación controlada:** HALF-OPEN deja pasar una sola prueba; no se golpea al proveedor con
+   todo el tráfico acumulado en el instante en que vuelve.
+5. El single-flight (escenario A) evita que N requests idénticos se conviertan en N timeouts.
+
+_Siguiente paso en producción:_ fallback a un proveedor/modelo secundario detrás de la misma
+interfaz `LLMProvider`, con un breaker por proveedor; y _retries_ sólo para errores de conexión
+(no para timeouts de generación, que ya consumieron el presupuesto de latencia), con jitter.
+
+### C — Slow consumer streaming ✅ implementado
+
+> Un cliente lee el SSE muy lento. ¿Qué pasa con el buffer? ¿Se cancela el request upstream?
+
+- **No hay buffer intermedio que crezca.** El generador es _pull-based_: sólo se le pide al LLM el
+  próximo token cuando el anterior ya fue aceptado por el transporte. Si el cliente lee lento, el
+  buffer de escritura de uvicorn llega a su _high-water mark_, `send()` espera el drain, dejamos de
+  leer del socket del proveedor y el **control de flujo TCP** frena al proveedor. Memoria por
+  stream: O(1 chunk) + buffers del kernel. Con una cola intermedia (productor/consumidor) habría
+  que acotarla y decidir qué descartar; el pull lo evita por diseño.
+- **Pero esperar indefinidamente también es un problema:** un cliente que deja de leer pero no
+  cierra retiene una corrutina, una conexión al proveedor y tokens que se siguen facturando. Cada
+  `send` tiene un timeout (`STREAM_STALL_TIMEOUT_S=10`): si el cliente no drena en ese tiempo, se
+  aborta el stream, **se cierra la conexión upstream** y se audita con
+  `termination: slow_consumer`. No cuenta como fallo del proveedor para el breaker.
+- Test `test_slow_consumer_is_aborted`: un `send` que nunca retorna después del 2º chunk → el app
+  termina en ~100 ms y el stream del proveedor queda cerrado.
+
+_Mejora pendiente:_ comentarios SSE de heartbeat (`: ping`) durante silencios largos del LLM, para
+que proxies con idle-timeout no corten la conexión y para detectar antes clientes muertos.
 
 ---
 

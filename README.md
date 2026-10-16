@@ -28,7 +28,7 @@ curl -s -X POST localhost:8000/v1/infer \
 ```
 
 Repetir el mismo request devuelve `"cache_hit": true`. Modelos permitidos: `gpt-4o`, `gpt-4o-mini`
-(`ALLOWED_MODELS`). `config` acepta `temperature`, `max_tokens` y `top_p`.
+(`ALLOWED_MODELS`). `config` acepta `temperature`, `max_tokens`, `top_p` y `timeout_s`.
 
 Rate limit: 60 req/min por API key. Al excederlo:
 
@@ -38,9 +38,29 @@ Rate limit: 60 req/min por API key. Al excederlo:
 
 Errores (formato `{"error": ..., ...}`): 401 `missing_api_key` / `invalid_api_key`,
 400 `unsupported_model`, 422 `invalid_request`, 429 `rate_limit_exceeded`, 502 `llm_upstream_error`,
-504 `llm_timeout`.
+503 `llm_unavailable` (circuit breaker abierto), 504 `llm_timeout`. `config.timeout_s` fija el
+timeout por request (default 30 s, máximo 120 s).
 
-### `POST /v1/stream` — streaming SSE (TBD)
+### `POST /v1/stream` — streaming SSE
+
+```bash
+curl -N -X POST localhost:8000/v1/stream \
+  -H 'X-API-Key: dev-key-123' -H 'Content-Type: application/json' \
+  -d '{"model": "gpt-4o", "input": "Hola", "config": {"timeout_s": 10}}'
+```
+
+```
+data: {"token": "La", "index": 0}
+
+data: {"token": " arquitectura", "index": 1}
+
+data: [DONE]
+```
+
+Mismo body, auth y rate limit que `/v1/infer`. Errores del LLM durante el stream llegan como evento
+(`data: {"error": "llm_unavailable", "retry_after_s": 45}`, `llm_timeout`, `llm_error`). Cortar el
+`curl` con Ctrl+C cancela la generación upstream. Cada stream se audita en el Redis Stream
+`audit:streams`.
 
 ### `POST /v1/classify` — clasificación con modelo ML embebido (TBD)
 
