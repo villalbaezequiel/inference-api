@@ -51,3 +51,14 @@ async def test_structured_log_marks_timeouts(client, caplog):
     assert r.status_code == 504
     record = next(rec for rec in caplog.records if rec.name == "app.access")
     assert record.status == "timeout"
+
+
+async def test_metrics_expose_requests_latency_and_cache(client):
+    await client.post("/v1/infer", json=infer_body("metrics"), headers=HEADERS)
+    await client.post("/v1/infer", json=infer_body("metrics"), headers=HEADERS)
+
+    text = (await client.get("/metrics")).text
+    assert 'http_requests_total{endpoint="/v1/infer",method="POST",status="200"}' in text
+    assert 'http_request_duration_seconds_bucket{endpoint="/v1/infer"' in text
+    assert 'cache_requests_total{result="hit"}' in text
+    assert 'cache_requests_total{result="miss"}' in text
