@@ -17,6 +17,7 @@ router = APIRouter(prefix="/v1", tags=["inference"])
     responses={
         401: {"model": ErrorResponse},
         429: {"model": ErrorResponse},
+        503: {"model": ErrorResponse, "description": "Circuit breaker abierto"},
         502: {"model": ErrorResponse, "description": "Error del proveedor LLM"},
         504: {"model": ErrorResponse, "description": "Timeout del proveedor LLM"},
     },

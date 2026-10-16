@@ -7,10 +7,12 @@ class InferenceConfig(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=256, ge=1, le=4096)
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+    # Timeout por request (R2). Si no viene, se usa LLM_DEFAULT_TIMEOUT_S.
+    timeout_s: float | None = Field(default=None, gt=0.0)
 
     def cache_relevant(self) -> dict:
-        """Parámetros que cambian el output (forman parte de la cache key)."""
-        return self.model_dump(exclude_none=True)
+        """Parámetros que cambian el output (forman parte de la cache key; el timeout no)."""
+        return self.model_dump(exclude={"timeout_s"}, exclude_none=True)
 
 
 class InferRequest(BaseModel):

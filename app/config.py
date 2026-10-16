@@ -35,11 +35,30 @@ class Settings(BaseSettings):
     llm_provider: str = "mock"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
-    llm_timeout_s: float = 30.0
+    # Timeout por request: default si el cliente no manda `config.timeout_s`, y techo.
+    llm_default_timeout_s: float = 30.0
+    llm_max_timeout_s: float = 120.0
     allowed_models: str = "gpt-4o,gpt-4o-mini"
 
-    # Mock provider: latencia simulada.
+    # Mock provider: latencia simulada (total en sync, por token en streaming).
     mock_llm_latency_ms: int = 150
+    mock_llm_token_delay_ms: int = 30
+
+    # --- Circuit breaker ---------------------------------------------------
+    # N fallos dentro de una ventana de W segundos -> abierto D segundos.
+    cb_failure_threshold: int = 5
+    cb_failure_window_s: float = 30.0
+    cb_open_duration_s: float = 60.0
+
+    # --- Streaming ---------------------------------------------------------
+    # Si el cliente no consume un chunk en este tiempo, se lo considera
+    # "slow consumer" y se aborta el stream (y el request upstream).
+    stream_stall_timeout_s: float = 10.0
+
+    # --- Audit -------------------------------------------------------------
+    audit_queue_size: int = 10_000
+    audit_stream_key: str = "audit:streams"
+    audit_stream_maxlen: int = 100_000
 
     # ----------------------------------------------------------------------
     @property

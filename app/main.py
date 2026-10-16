@@ -9,9 +9,11 @@ from redis.asyncio import Redis
 
 from app.api.middleware.rate_limit import RateLimiter, RateLimitExceeded
 from app.api.middleware.request_context import RequestContextMiddleware
-from app.api.routes import health, infer
+from app.api.routes import health, infer, stream
 from app.config import Settings, get_settings
+from app.core.audit import AuditWriter
 from app.core.cache import InferenceCache, create_redis
+from app.core.circuit_breaker import CircuitBreaker, CircuitOpenError
 from app.core.inference_service import InferenceService
 from app.core.llm_client import (
     LLMClient,
@@ -27,6 +29,7 @@ def create_app(
     settings: Settings | None = None,
     redis: Redis | None = None,
     provider: LLMProvider | None = None,
+    breaker: CircuitBreaker | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
 
@@ -34,19 +37,29 @@ def create_app(
     async def lifespan(app: FastAPI):
         # Todo lo pesado ocurre UNA vez acá, nunca por request.
         r = redis or create_redis(settings.redis_url, settings.redis_socket_timeout_s, settings.redis_max_connections)
-        llm = LLMClient(provider or build_provider(settings), settings.llm_timeout_s)
+        cb = breaker or CircuitBreaker(
+            settings.cb_failure_threshold, settings.cb_failure_window_s, settings.cb_open_duration_s
+        )
+        llm = LLMClient(provider or build_provider(settings), cb)
+        audit = AuditWriter(r, settings.audit_stream_key, settings.audit_stream_maxlen, settings.audit_queue_size)
+        await audit.start()
 
         app.state.settings = settings
+        app.state.llm_client = llm
+        app.state.audit_writer = audit
         app.state.rate_limiter = RateLimiter(r, settings.rate_limit_per_minute, fail_open=settings.rate_limit_fail_open)
         app.state.inference_service = InferenceService(
             llm,
             InferenceCache(r, settings.cache_ttl_s),
+            settings.llm_default_timeout_s,
+            settings.llm_max_timeout_s,
             settings.single_flight_lock_ttl_s,
             settings.single_flight_wait_s,
         )
         try:
             yield
         finally:
+            await audit.stop()
             await llm.aclose()
             if redis is None:
                 await r.aclose()
@@ -54,6 +67,7 @@ def create_app(
     app = FastAPI(title="AI Inference API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(RequestContextMiddleware)
     app.include_router(infer.router)
+    app.include_router(stream.router)
     app.include_router(health.router)
     _register_exception_handlers(app)
     return app
@@ -73,6 +87,12 @@ def _register_exception_handlers(app: FastAPI) -> None:
     async def _rate_limited(_: Request, exc: RateLimitExceeded):
         return _error(
             429, "rate_limit_exceeded", retry_after_s=exc.retry_after_s, headers={"Retry-After": str(exc.retry_after_s)}
+        )
+
+    @app.exception_handler(CircuitOpenError)
+    async def _circuit_open(_: Request, exc: CircuitOpenError):
+        return _error(
+            503, "llm_unavailable", retry_after_s=exc.retry_after_s, headers={"Retry-After": str(exc.retry_after_s)}
         )
 
     @app.exception_handler(LLMTimeoutError)

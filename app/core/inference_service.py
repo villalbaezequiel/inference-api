@@ -31,12 +31,25 @@ class InferenceResult:
 
 
 class InferenceService:
-    def __init__(self, llm: LLMClient, cache: InferenceCache, lock_ttl_s: float, follower_wait_s: float):
+    def __init__(
+        self,
+        llm: LLMClient,
+        cache: InferenceCache,
+        default_timeout_s: float,
+        max_timeout_s: float,
+        lock_ttl_s: float,
+        follower_wait_s: float,
+    ):
         self.llm = llm
         self.cache = cache
+        self.default_timeout_s = default_timeout_s
+        self.max_timeout_s = max_timeout_s
         self.lock_ttl_s = lock_ttl_s
         self.follower_wait_s = follower_wait_s
         self._flight: SingleFlight[Completion] = SingleFlight()
+
+    def timeout_for(self, req: InferRequest) -> float:
+        return min(req.config.timeout_s or self.default_timeout_s, self.max_timeout_s)
 
     async def infer(self, req: InferRequest) -> InferenceResult:
         key = build_cache_key(req.model, req.input, req.config.cache_relevant())
@@ -45,9 +58,9 @@ class InferenceService:
         if cached is not None:
             return InferenceResult(Completion(**cached), cache_hit=True)
 
-        timeout_s = self.llm.timeout_s
+        timeout_s = self.timeout_for(req)
         try:
-            # El deadline "real" lo aplica LLMClient. Este es una red de seguridad para
+            # El deadline "real" lo aplica LLMClient (y cuenta para el breaker). Este es una red de seguridad para
             # quien espera un resultado compartido, con un pequeño margen para que el
             # timeout interno gane la carrera.
             async with asyncio.timeout(timeout_s + 0.25):
@@ -72,7 +85,7 @@ class InferenceService:
                 token = await self.cache.try_lock(key, self.lock_ttl_s)
             except RedisError as exc:
                 logger.warning("lock unavailable, calling LLM directly: %r", exc)
-                return await self._call_and_store(key, req)
+                return await self._call_and_store(key, req, timeout_s)
 
             if token is not None:  # somos líderes entre réplicas
                 try:
@@ -80,7 +93,7 @@ class InferenceService:
                     cached = await self.cache.get(key)
                     if cached is not None:
                         return Completion(**cached)
-                    return await self._call_and_store(key, req)
+                    return await self._call_and_store(key, req, timeout_s)
                 finally:
                     await self.cache.release_lock(key, token)
 
@@ -95,13 +108,13 @@ class InferenceService:
                     if not await self.cache.lock_exists(key):
                         break  # el líder terminó/murió sin cachear -> reintentar liderazgo
                 except RedisError:
-                    return await self._call_and_store(key, req)
+                    return await self._call_and_store(key, req, timeout_s)
             else:
                 logger.warning("single-flight wait exceeded, calling LLM directly")
-                return await self._call_and_store(key, req)
+                return await self._call_and_store(key, req, timeout_s)
 
-    async def _call_and_store(self, key: str, req: InferRequest) -> Completion:
-        completion = await self.llm.complete(req.model, req.input, req.config)
+    async def _call_and_store(self, key: str, req: InferRequest, timeout_s: float) -> Completion:
+        completion = await self.llm.complete(req.model, req.input, req.config, timeout_s)
         await self.cache.set(
             key,
             {"text": completion.text, "tokens_in": completion.tokens_in, "tokens_out": completion.tokens_out},
