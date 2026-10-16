@@ -29,9 +29,15 @@ async def infer(
 ) -> InferResponse:
     start = time.perf_counter()
     validate_model(request, body.model)
+    request.state.log_extra = {"model": body.model}
 
     result = await service.infer(body)
 
+    request.state.log_extra.update(
+        cache_hit=result.cache_hit,
+        tokens_in=result.completion.tokens_in,
+        tokens_out=result.completion.tokens_out,
+    )
     return InferResponse(
         request_id=request.state.request_id,
         output=result.completion.text,

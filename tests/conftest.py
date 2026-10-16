@@ -8,6 +8,7 @@ import pytest
 from asgi_lifespan import LifespanManager
 
 from app.config import Settings
+from app.core.circuit_breaker import CircuitBreaker
 from app.core.llm_client import MockProvider
 from app.core.train import train
 from app.main import create_app
@@ -15,6 +16,19 @@ from app.main import create_app
 API_KEY = "test-key"
 OTHER_KEY = "other-key"
 HEADERS = {"X-API-Key": API_KEY}
+
+
+class FakeClock:
+    """Reloj controlable para el circuit breaker: tests deterministas sin sleep."""
+
+    def __init__(self, start: float = 1000.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 class TrackingProvider(MockProvider):
@@ -51,6 +65,7 @@ def settings(models_dir) -> Settings:
         mock_llm_token_delay_ms=1,
         llm_default_timeout_s=5,
         stream_stall_timeout_s=2,
+        log_level="WARNING",
     )
 
 
@@ -65,10 +80,20 @@ def provider() -> TrackingProvider:
 
 
 @pytest.fixture
-def app_factory(settings, redis, provider):
+def clock() -> FakeClock:
+    return FakeClock()
+
+
+@pytest.fixture
+def breaker(clock) -> CircuitBreaker:
+    return CircuitBreaker(failure_threshold=5, failure_window_s=30, open_duration_s=60, clock=clock)
+
+
+@pytest.fixture
+def app_factory(settings, redis, provider, breaker):
     def _make(**overrides):
         cfg = settings.model_copy(update=overrides)
-        return create_app(settings=cfg, redis=redis, provider=provider)
+        return create_app(settings=cfg, redis=redis, provider=provider, breaker=breaker)
 
     return _make
 

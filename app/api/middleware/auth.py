@@ -11,6 +11,8 @@ import hmac
 from fastapi import HTTPException, Request, Security, status
 from fastapi.security import APIKeyHeader
 
+from app.logging_config import client_id_var
+
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
@@ -28,4 +30,7 @@ async def require_api_key(request: Request, api_key: str | None = Security(api_k
     client_id = _lookup(request.app.state.settings.api_key_map, api_key)
     if client_id is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
+    # Para el log de acceso (middleware) y cualquier log emitido durante el request.
+    request.state.client_id = client_id
+    client_id_var.set(client_id)
     return client_id

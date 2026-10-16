@@ -88,8 +88,15 @@ Los modelos se entrenan en el build de la imagen y se cargan una vez al arranque
 
 ```bash
 curl http://localhost:8000/health
-# {"status": "ok"}
+# {"status": "ok", "redis": "ok", "llm_circuit": "closed", "models_loaded": ["v1", "v2"]}
 ```
+
+Con Redis caído o el circuito abierto responde `"status": "degraded"` (200); si falta un modelo, 503.
+
+### Logs
+
+Una línea JSON por request en stdout (`make logs`), con `timestamp`, `request_id`, `client_id`,
+`model`, `latency_ms`, `cache_hit` y `status`. Nivel configurable con `LOG_LEVEL`.
 
 ## Desarrollo
 

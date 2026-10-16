@@ -35,6 +35,7 @@ async def stream(
     audit: AuditWriter = Depends(get_audit_writer),
 ) -> SSEResponse:
     validate_model(request, body.model)
+    request.state.log_extra = {"model": body.model, "cache_hit": False}
     settings = request.app.state.settings
     timeout_s = min(body.config.timeout_s or settings.llm_default_timeout_s, settings.llm_max_timeout_s)
     request_id = request.state.request_id
@@ -73,6 +74,7 @@ async def stream(
             if ctx.termination:
                 status = "cancelled"
                 error = ctx.termination
+            request.state.log_extra.update(status=status, tokens_out=len(tokens), error=error)
             # Auditoría: put_nowait en cola acotada -> nunca bloquea el response.
             audit.submit(
                 {
