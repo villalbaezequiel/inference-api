@@ -2,11 +2,21 @@
 
 from fastapi import HTTPException, Request, status
 
+from app.core.audit import AuditWriter
 from app.core.inference_service import InferenceService
+from app.core.llm_client import LLMClient
 
 
 def get_inference_service(request: Request) -> InferenceService:
     return request.app.state.inference_service
+
+
+def get_llm_client(request: Request) -> LLMClient:
+    return request.app.state.llm_client
+
+
+def get_audit_writer(request: Request) -> AuditWriter:
+    return request.app.state.audit_writer
 
 
 def validate_model(request: Request, model: str) -> None:
