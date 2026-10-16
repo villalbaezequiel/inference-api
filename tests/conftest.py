@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 
 import fakeredis
@@ -14,13 +15,32 @@ OTHER_KEY = "other-key"
 HEADERS = {"X-API-Key": API_KEY}
 
 
+class TrackingProvider(MockProvider):
+    """MockProvider que registra cuántos tokens generó y si el stream se cerró."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.tokens_generated = 0
+        self.stream_closed = asyncio.Event()
+
+    async def stream(self, model, prompt, config):
+        try:
+            async for token in super().stream(model, prompt, config):
+                self.tokens_generated += 1
+                yield token
+        finally:
+            self.stream_closed.set()
+
+
 @pytest.fixture
 def settings() -> Settings:
     return Settings(
         api_keys=f"{API_KEY}:client-test,{OTHER_KEY}:client-other",
         rate_limit_per_minute=1000,
         mock_llm_latency_ms=20,
-        llm_timeout_s=5,
+        mock_llm_token_delay_ms=1,
+        llm_default_timeout_s=5,
+        stream_stall_timeout_s=2,
     )
 
 
@@ -30,8 +50,8 @@ def redis():
 
 
 @pytest.fixture
-def provider() -> MockProvider:
-    return MockProvider(latency_ms=20)
+def provider() -> TrackingProvider:
+    return TrackingProvider(latency_ms=20, token_delay_ms=1)
 
 
 @pytest.fixture

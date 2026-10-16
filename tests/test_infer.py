@@ -8,6 +8,7 @@ import pytest
 from asgi_lifespan import LifespanManager
 
 from app.core.cache import CACHE_PREFIX, InferenceCache, build_cache_key, create_redis
+from app.core.circuit_breaker import CircuitBreaker
 from app.core.inference_service import InferenceService
 from app.core.llm_client import LLMClient, MockProvider
 from app.main import create_app
@@ -84,8 +85,10 @@ async def test_thundering_herd_single_llm_call(client, provider):
 async def test_thundering_herd_across_replicas(redis):
     """Tres réplicas (SingleFlight distinto) comparten Redis: una sola llamada al LLM."""
     provider = MockProvider(latency_ms=100)
-    llm = LLMClient(provider, timeout_s=5)
-    replicas = [InferenceService(llm, InferenceCache(redis, 60), lock_ttl_s=5, follower_wait_s=5) for _ in range(3)]
+    llm = LLMClient(provider, CircuitBreaker())
+    replicas = [
+        InferenceService(llm, InferenceCache(redis, 60), 5, 10, lock_ttl_s=5, follower_wait_s=5) for _ in range(3)
+    ]
     req = InferRequest(model="gpt-4o", input="multi replica")
     results = await asyncio.gather(*(replicas[i % 3].infer(req) for i in range(30)))
     assert provider.calls == 1
