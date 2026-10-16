@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -13,3 +14,8 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "SIM"]
+ignore = [
+    "B008",     # Depends() en defaults es el patrón de FastAPI
+    "UP046",    # Generic[T] explícito: más legible para revisores
+    "SIM905",   # vocabulario del mock como texto: más legible que una lista literal
+]
