@@ -9,7 +9,7 @@ from redis.asyncio import Redis
 
 from app.api.middleware.rate_limit import RateLimiter, RateLimitExceeded
 from app.api.middleware.request_context import RequestContextMiddleware
-from app.api.routes import health, infer, stream
+from app.api.routes import classify, health, infer, stream
 from app.config import Settings, get_settings
 from app.core.audit import AuditWriter
 from app.core.cache import InferenceCache, create_redis
@@ -23,6 +23,7 @@ from app.core.llm_client import (
     LLMUpstreamError,
     build_provider,
 )
+from app.core.ml_model import ModelRegistry, UnknownModelVersion
 
 
 def create_app(
@@ -41,11 +42,19 @@ def create_app(
             settings.cb_failure_threshold, settings.cb_failure_window_s, settings.cb_open_duration_s
         )
         llm = LLMClient(provider or build_provider(settings), cb)
+        registry = ModelRegistry(
+            settings.models_dir,
+            settings.model_versions_list,
+            settings.default_model_version,
+            threads=settings.ml_threads,
+        )
+        await registry.load()  # fail-fast si faltan artefactos
         audit = AuditWriter(r, settings.audit_stream_key, settings.audit_stream_maxlen, settings.audit_queue_size)
         await audit.start()
 
         app.state.settings = settings
         app.state.llm_client = llm
+        app.state.model_registry = registry
         app.state.audit_writer = audit
         app.state.rate_limiter = RateLimiter(r, settings.rate_limit_per_minute, fail_open=settings.rate_limit_fail_open)
         app.state.inference_service = InferenceService(
@@ -60,6 +69,7 @@ def create_app(
             yield
         finally:
             await audit.stop()
+            await registry.close()
             await llm.aclose()
             if redis is None:
                 await r.aclose()
@@ -68,6 +78,7 @@ def create_app(
     app.add_middleware(RequestContextMiddleware)
     app.include_router(infer.router)
     app.include_router(stream.router)
+    app.include_router(classify.router)
     app.include_router(health.router)
     _register_exception_handlers(app)
     return app
@@ -106,6 +117,10 @@ def _register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(LLMClientError)
     async def _llm_client(_: Request, exc: LLMClientError):
         return _error(400, "llm_rejected_request", str(exc))
+
+    @app.exception_handler(UnknownModelVersion)
+    async def _unknown_version(_: Request, exc: UnknownModelVersion):
+        return _error(400, "unknown_model_version", str(exc))
 
     @app.exception_handler(HTTPException)
     async def _http(_: Request, exc: HTTPException):

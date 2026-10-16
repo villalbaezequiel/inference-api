@@ -41,3 +41,16 @@ class ErrorResponse(BaseModel):
     error: str
     message: str | None = None
     retry_after_s: int | None = None
+
+
+class ClassifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input: str = Field(min_length=1, max_length=10_000)
+
+
+class ClassifyResponse(BaseModel):
+    label: str
+    confidence: float
+    model_version: str
+    latency_ms: int

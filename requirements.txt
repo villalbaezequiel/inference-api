@@ -3,3 +3,6 @@ uvicorn[standard]==0.53.0
 httpx==0.28.1
 redis==8.1.0
 pydantic-settings==2.16.0
+scikit-learn==1.9.1
+numpy==2.5.3
+joblib==1.6.0
