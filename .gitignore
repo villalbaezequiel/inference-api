@@ -5,3 +5,4 @@ __pycache__/
 .env
 .ruff_cache/
 models/
+loadtest/results/*.html

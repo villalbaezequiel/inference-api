@@ -24,3 +24,15 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+
+  # Bonus: `make load` (headless) o `docker compose --profile load up locust` -> http://localhost:8089
+  locust:
+    profiles: ["load"]
+    image: locustio/locust:2.46.7
+    volumes:
+      - ./loadtest:/mnt/locust
+    command: >
+      -f /mnt/locust/locustfile.py --host http://app:8000
+      --headless -u 150 -r 30 -t 60s --csv /mnt/locust/results/run --html /mnt/locust/results/report.html
+    depends_on:
+      - app
