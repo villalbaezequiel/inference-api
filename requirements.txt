@@ -6,3 +6,4 @@ pydantic-settings==2.16.0
 scikit-learn==1.9.1
 numpy==2.5.3
 joblib==1.6.0
+prometheus-client==0.26.0

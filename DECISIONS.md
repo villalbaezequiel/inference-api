@@ -5,7 +5,7 @@ hice, **por qué** y **qué dejé afuera a propósito**. Se actualiza en cada et
 
 > Estado: **etapa 4 — observabilidad y tests**. R1, R2 y R3 completos; tests del circuit breaker,
 > healthcheck completo (`redis`, `llm_circuit`, `models_loaded`) y logs JSON estructurados por
-> request. Las decisiones de abajo son el diseño de partida; cada etapa las confirma o corrige.
+> request. Bonus: métricas Prometheus en `GET /metrics` y carga con locust (102 RPS, 0 errores). Las decisiones de abajo son el diseño de partida; cada etapa las confirma o corrige.
 
 ---
 
@@ -27,6 +27,7 @@ hice, **por qué** y **qué dejé afuera a propósito**. Se actualiza en cada et
 | Inferencia ML       | `ThreadPoolExecutor` **dedicado**                                        | CPU-bound fuera del event loop; no compite con el threadpool default de anyio.                             |
 | Logs                | JSON a stdout, **una línea por request** desde el middleware ASGI         | Campos mínimos del enunciado en un solo lugar; las rutas sólo aportan contexto (`model`, `cache_hit`).     |
 | Healthcheck         | `degraded` con **200** si Redis o el circuito fallan; **503** sin modelos | La API sigue sirviendo degradada; sólo un pod sin modelos debe salir del balanceo.                         |
+| Métricas            | `prometheus-client` en `GET /metrics`, labels por **ruta**, no por path   | Requests, latencia y cache hit ratio (bonus); cardinalidad acotada aunque lleguen paths arbitrarios.       |
 | App factory         | `create_app()` + `uvicorn --factory`                                     | Cada test crea una app aislada; el estado se inicializa en el lifespan, no al importar.                    |
 
 ---
@@ -53,7 +54,8 @@ cliente ──HTTP──▶ FastAPI (1 proceso por contenedor)
                     ├─ POST /v1/infer    ─▶ auth ─▶ rate limit ─▶ cache ──miss──▶ LLMClient ─[circuit breaker]─▶ proveedor
                     ├─ POST /v1/stream   ─▶ auth ─▶ rate limit ─▶ SSE ◀── LLMClient.stream
                     ├─ POST /v1/classify ─▶ auth ─▶ ModelRegistry (v1 | v2, cargado una vez al arranque)
-                    └─ GET  /health
+                    ├─ GET  /health
+                    └─ GET  /metrics
                                                                        Redis: rate limit, cache
 ```
 
@@ -64,12 +66,13 @@ app/
   main.py                    create_app(), lifespan, handlers de error
   config.py                  Settings (todo por env)
   logging_config.py          formatter JSON + contextvars (request_id, client_id)
+  metrics.py                 contadores e histogramas Prometheus
   schemas.py                 modelos Pydantic de request/response
   api/
     deps.py                  acceso a singletons de app.state
     sse.py                   SSEResponse: desconexión, slow consumer, cierre determinístico
-    routes/                  infer.py, stream.py, classify.py, health.py
-    middleware/              auth.py, rate_limit.py, request_context.py (request_id + log de acceso)
+    routes/                  infer.py, stream.py, classify.py, health.py, metrics.py
+    middleware/              auth.py, rate_limit.py, request_context.py (request_id + log de acceso + métricas HTTP)
   core/
     llm_client.py            abstracción del proveedor + timeouts
     circuit_breaker.py       closed / open / half-open
@@ -301,7 +304,7 @@ los loggers de uvicorn; su access log se silencia porque duplica el nuestro). Ca
 - En `/v1/stream` el status HTTP siempre es 200: el generador escribe el resultado real
   (`success | timeout | error | cancelled`) antes de que el middleware loguee, y la latencia
   incluye todo el stream.
-- `/health` no se loguea: lo sondea el orquestador cada pocos segundos y sólo agrega ruido.
+- `/health` y `/metrics` no se loguean: lo sondea el orquestador cada pocos segundos y sólo agrega ruido.
 - Nivel por `LOG_LEVEL` (default `INFO`).
 
 **Healthcheck.** `GET /health` → `{"status", "redis", "llm_circuit", "models_loaded"}`.
@@ -316,6 +319,30 @@ los loggers de uvicorn; su access log se silencia porque duplica el nuestro). Ca
 Si un Redis o un proveedor caído hicieran fallar el health, el orquestador reiniciaría **todas** las
 réplicas a la vez por una dependencia externa: una falla parcial se convertiría en total.
 
+**Métricas Prometheus (bonus).** `GET /metrics`, público como `/health` (en producción lo
+restringiría a la red interna del scraper).
+
+| Métrica                         | Tipo      | Labels                         | Para qué                                |
+| ------------------------------- | --------- | ------------------------------ | --------------------------------------- |
+| `http_requests_total`           | counter   | `endpoint`, `method`, `status` | Requests totales y tasa de error        |
+| `http_request_duration_seconds` | histogram | `endpoint`                     | Latencia (P95 con `histogram_quantile`) |
+| `cache_requests_total`          | counter   | `result` = `hit` \| `miss`     | Cache hit ratio                         |
+
+- Se registran en el mismo `RequestContextMiddleware` que el log: un solo punto de medición.
+- `endpoint` es el **template de la ruta** (`/v1/infer`), y `unmatched` para 404: con el path
+  crudo, un cliente podría crear series infinitas.
+- Buckets de latencia densos alrededor de 200 ms (0.1 / 0.2 / 0.3 s) para medir el SLA de P95.
+- Hit ratio: `sum(rate(cache_requests_total{result="hit"}[5m])) / sum(rate(cache_requests_total[5m]))`.
+- El registry de `prometheus-client` es por proceso; con 1 worker por contenedor, cada réplica es
+  un target de scrape y no hace falta el modo multiproceso.
+
+**Carga (bonus).** `loadtest/locustfile.py` simula tráfico mixto (60 % infer con prompts
+repetidos, 25 % classify, 15 % stream); `make load` lo corre 60 s a ~105 RPS contra una réplica.
+Resultado: **102.6 RPS, 0 errores**, P50 47 ms, P95 210 ms; cache hit ratio 69 %. El P95 de
+`/v1/infer` (~230 ms) lo definen los _misses_, que pagan los 150 ms del LLM simulado: el SLA de
+200 ms depende del proveedor y del hit ratio, no del overhead de la API. Detalle en
+[`loadtest/results/RESULTS.md`](loadtest/results/RESULTS.md).
+
 ---
 
 ## Plan por etapas
@@ -326,7 +353,7 @@ réplicas a la vez por una dependencia externa: una falla parcial se convertirí
 | 1 — R1 | `/v1/infer`: auth `X-API-Key`, rate limit 60 req/min en Redis, cache con TTL configurable                                             |
 | 2 — R2 | `/v1/stream`: SSE, cancelación upstream, timeout por request, circuit breaker (5 fallos/30 s → abierto 60 s), auditoría en background |
 | 3 — R3 | `/v1/classify`: modelo cargado una vez sin bloquear el loop, routing por `X-Model-Version`                                            |
-| 4      | Tests de circuit breaker, healthcheck completo, logs JSON                                                                             |
+| 4      | Tests de circuit breaker, healthcheck completo, logs JSON; bonus: métricas Prometheus y carga con locust                              |
 | 5      | Completar DECISIONS, verificar `docker compose up`                                                                                    |
 
 ---

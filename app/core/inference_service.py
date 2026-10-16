@@ -19,6 +19,7 @@ from redis.exceptions import RedisError
 from app.core.cache import InferenceCache, build_cache_key
 from app.core.llm_client import Completion, LLMClient, LLMTimeoutError
 from app.core.single_flight import SingleFlight
+from app.metrics import CACHE_REQUESTS
 from app.schemas import InferRequest
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,9 @@ class InferenceService:
 
         cached = await self.cache.get(key)
         if cached is not None:
+            CACHE_REQUESTS.labels("hit").inc()
             return InferenceResult(Completion(**cached), cache_hit=True)
+        CACHE_REQUESTS.labels("miss").inc()
 
         timeout_s = self.timeout_for(req)
         try:

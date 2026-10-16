@@ -10,7 +10,7 @@ from redis.asyncio import Redis
 
 from app.api.middleware.rate_limit import RateLimiter, RateLimitExceeded
 from app.api.middleware.request_context import RequestContextMiddleware
-from app.api.routes import classify, health, infer, stream
+from app.api.routes import classify, health, infer, metrics, stream
 from app.config import Settings, get_settings
 from app.core.audit import AuditWriter
 from app.core.cache import InferenceCache, create_redis
@@ -88,6 +88,7 @@ def create_app(
     app.include_router(stream.router)
     app.include_router(classify.router)
     app.include_router(health.router)
+    app.include_router(metrics.router)
     _register_exception_handlers(app)
     return app
 

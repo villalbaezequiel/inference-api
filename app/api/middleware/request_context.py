@@ -1,4 +1,5 @@
-"""Middleware ASGI puro: asigna request_id, lo devuelve en X-Request-ID y loguea cada request.
+"""Middleware ASGI puro: asigna request_id, lo devuelve en X-Request-ID, loguea cada request
+y registra las métricas HTTP.
 
 Es ASGI puro (no BaseHTTPMiddleware) porque BaseHTTPMiddleware bufferiza y rompe
 la propagación de desconexión en respuestas streaming (SSE, R2).
@@ -11,11 +12,12 @@ import uuid
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.logging_config import client_id_var, request_id_var
+from app.metrics import REQUEST_LATENCY, REQUESTS_TOTAL
 
 logger = logging.getLogger("app.access")
 
 # Sondeados cada pocos segundos por el orquestador: loguearlos es ruido.
-_SILENT_PATHS = {"/health"}
+_SILENT_PATHS = {"/health", "/metrics"}
 
 
 class RequestContextMiddleware:
@@ -48,6 +50,13 @@ class RequestContextMiddleware:
         try:
             await self.app(scope, receive, send_wrapper)
         finally:
+            elapsed = time.perf_counter() - start
+            # Path de la ruta (no el path crudo) para acotar la cardinalidad de labels.
+            route = scope.get("route")
+            endpoint = getattr(route, "path", "unmatched")
+            REQUESTS_TOTAL.labels(endpoint, scope["method"], str(status_code)).inc()
+            REQUEST_LATENCY.labels(endpoint).observe(elapsed)
+
             if scope["path"] not in _SILENT_PATHS:
                 # Las rutas completan model, cache_hit, etc. en request.state.log_extra.
                 extra = dict(state.get("log_extra") or {})
@@ -55,15 +64,14 @@ class RequestContextMiddleware:
                     "status",
                     "success" if status_code < 400 else ("timeout" if status_code == 504 else "error"),
                 )
-                route = scope.get("route")
                 logger.info(
                     "request completed",
                     extra={
                         "request_id": request_id,
                         "client_id": state.get("client_id"),
-                        "endpoint": getattr(route, "path", scope["path"]),
+                        "endpoint": endpoint,
                         "http_status": status_code,
-                        "latency_ms": round((time.perf_counter() - start) * 1000),
+                        "latency_ms": round(elapsed * 1000),
                         **extra,
                     },
                 )
